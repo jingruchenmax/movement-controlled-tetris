@@ -1,5 +1,7 @@
 using UnityEngine;
-
+using System.Net.Sockets;
+using System.IO;
+using System.Threading;
 public class Piece : MonoBehaviour
 {
     public Board board { get; private set; }
@@ -16,6 +18,14 @@ public class Piece : MonoBehaviour
     private float moveTime;
     private float lockTime;
 
+    private TcpClient tcpClient;
+    private StreamReader reader;
+    private Thread tcpThread;
+    private string lastMessage;
+    private string currentInputState = "Neutral";
+
+    public GameObject burst;
+    [SerializeField] private CameraEffect cameraEffect;
     public void Initialize(Board board, Vector3Int position, TetrominoData data)
     {
         this.data = data;
@@ -34,59 +44,82 @@ public class Piece : MonoBehaviour
         for (int i = 0; i < cells.Length; i++) {
             cells[i] = (Vector3Int)data.cells[i];
         }
+        ConnectToTCPServer();
     }
 
     private void Update()
     {
         board.Clear(this);
 
-        // We use a timer to allow the player to make adjustments to the piece
-        // before it locks in place
+        // Handle TCP inputs
+        if (!string.IsNullOrEmpty(lastMessage))
+        {
+            HandleTCPInput(lastMessage);
+            lastMessage = null;
+        }
+
+        // Once the piece has been inactive for too long it becomes locked
         lockTime += Time.deltaTime;
 
-        // Handle rotation
-        if (Input.GetKeyDown(KeyCode.Q)) {
-            Rotate(-1);
-        } else if (Input.GetKeyDown(KeyCode.E)) {
-            Rotate(1);
-        }
-
-        // Handle hard drop
-        if (Input.GetKeyDown(KeyCode.Space)) {
-            HardDrop();
-        }
-
-        // Allow the player to hold movement keys but only after a move delay
-        // so it does not move too fast
-        if (Time.time > moveTime) {
-            HandleMoveInputs();
-        }
-
         // Advance the piece to the next row every x seconds
-        if (Time.time > stepTime) {
+        if (Time.time > moveTime)
+        {
+            HandleContinuousInput();
+        }
+
+        if (Time.time > stepTime)
+        {
             Step();
         }
 
         board.Set(this);
     }
 
-    private void HandleMoveInputs()
+    private void HandleTCPInput(string message)
     {
-        // Soft drop movement
-        if (Input.GetKey(KeyCode.S))
+        Debug.Log($"Received TCP Message: {message}");
+        currentInputState = message;
+        switch (message)
         {
-            if (Move(Vector2Int.down)) {
-                // Update the step time to prevent double movement
-                stepTime = Time.time + stepDelay;
-            }
-        }
 
-        // Left/right movement
-        if (Input.GetKey(KeyCode.A)) {
-            Move(Vector2Int.left);
-        } else if (Input.GetKey(KeyCode.D)) {
-            Move(Vector2Int.right);
+            case "Leaning Left":
+                Move(Vector2Int.left);
+                cameraEffect.TriggerState("Leaning Left");
+                break;
+            case "Leaning Right":
+                Move(Vector2Int.right);
+                cameraEffect.TriggerState("Leaning Right");
+                break;
+            case "Leaning Forward":
+                Rotate(1);
+                cameraEffect.TriggerState("Neutral");
+                break;
+            case "Leaning Backward":
+                cameraEffect.TriggerState("Neutral");
+                break;
+            case "shake":
+                DestroyPiece(); // Rotate clockwise
+                cameraEffect.TriggerState("Neutral");
+                break;
+            case "Button Pressed":
+                Rotate(-1); // Rotate counterclockwise
+                break;
+            case "Neutral":
+                cameraEffect.TriggerState("Neutral");
+                break;
+            case "Button Released":
+                // No specific action for button released
+                break;
         }
+    }
+
+    private void HandleContinuousInput()
+    {
+        if (currentInputState == "Leaning Backward")
+        {
+            Step(); // Accelerate drop
+        }
+        moveTime = Time.time + moveDelay; // Reset move delay
     }
 
     private void Step()
@@ -97,7 +130,7 @@ public class Piece : MonoBehaviour
         Move(Vector2Int.down);
 
         // Once the piece has been inactive for too long it becomes locked
-        if (lockTime >= lockDelay) {
+        if (lockTime >= lockDelay){
             Lock();
         }
     }
@@ -116,6 +149,27 @@ public class Piece : MonoBehaviour
         board.Set(this);
         board.ClearLines();
         board.SpawnPiece();
+    }
+
+    private void DestroyPiece()
+    {
+        board.Clear(this);
+
+        foreach (Vector3Int cell in cells)
+        {
+            Vector3Int tilePosition = cell + position;
+            Vector3 worldPosition = board.tilemap.CellToWorld(tilePosition);
+            worldPosition += board.tilemap.cellSize / 2;
+            GameObject burstInstance = Instantiate(burst, worldPosition, Quaternion.identity);
+            Destroy(burstInstance, 1);
+        }
+
+        board.SpawnPiece();
+        lockTime = 0f;
+        stepTime = Time.time + stepDelay;
+        moveTime = Time.time + moveDelay;
+
+        Debug.Log("Current piece destroyed and replaced with a new piece.");
     }
 
     private bool Move(Vector2Int translation)
@@ -223,4 +277,53 @@ public class Piece : MonoBehaviour
         }
     }
 
+    private void ConnectToTCPServer()
+    {
+        try
+        {
+            tcpClient = new TcpClient("127.0.0.1", 65432);
+            reader = new StreamReader(tcpClient.GetStream());
+            tcpThread = new Thread(ListenForTCPMessages);
+            tcpThread.IsBackground = true;
+            tcpThread.Start();
+            Debug.Log("Connected to TCP Server.");
+        }
+        catch (System.Exception e)
+        {
+            Debug.Log($"Error connecting to TCP Server: {e.Message}");
+        }
+    }
+
+    private void ListenForTCPMessages()
+    {
+        try
+        {
+            while (true)
+            {
+                string message = reader.ReadLine();
+                if (!string.IsNullOrEmpty(message))
+                {
+                    lastMessage = message;
+                }
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.Log($"Disconnected from TCP Server: {e.Message}");
+        }
+    }
+
+    private void OnDestroy()
+    {
+        if (tcpClient != null)
+        {
+            reader.Close();
+            tcpClient.Close();
+        }
+
+        if (tcpThread != null)
+        {
+            tcpThread.Abort();
+        }
+    }
 }
